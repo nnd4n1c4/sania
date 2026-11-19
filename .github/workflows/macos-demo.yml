@@ -1,0 +1,230 @@
+# Live demo of the Firebase iOS findings CV-C58, CV-C59 and CV-C60 on macOS.
+#
+# The three drafts are CODE-VERIFIED ONLY because the Linux VM that produced
+# them has no Xcode. This workflow runs the real pinned client code on a
+# GitHub-hosted macOS runner, against in-test listeners on 127.0.0.1, with
+# DUMMY tokens only. No live credentials, no live GCP calls, no Firebase
+# project.
+#
+# Repo layout (this repo, "sania"):
+#   demo-tests/CV58DatabaseDemoTests.m      -> FirebaseDatabase/Tests/Unit/
+#   demo-tests/CV60FunctionsDemoTests.swift -> FirebaseFunctions/Tests/Unit/
+#   demo-tests/CV59FirestoreDemoTests.cc    -> Firestore/core/test/unit/remote/
+#   scripts/make-firestore-test-ca.sh       -> throwaway test CA for the C59 TLS leg
+#
+# The workflow checks out firebase/firebase-ios-sdk at the pinned SHA
+# 80e0bc6a8a788ee3644586a25aa76ad558411f0a (13.3.0) and copies the test files
+# into that checkout. Nothing in the SDK checkout is modified in this repo.
+#
+# COST WARNING (private repo): standard GitHub-hosted runners are free and
+# unlimited on PUBLIC repositories, but on a PRIVATE repo macOS minutes bill
+# at 10x against the 2,000 free Actions minutes/month, so roughly 200 macOS
+# minutes/month free. A first cold run of this workflow is roughly
+# 60 minutes wall for the SPM job plus 60-90 minutes wall for the CMake job,
+# so roughly 1,200-1,500 billed minutes, which EXCEEDS the free allowance.
+# Subsequent runs reuse the SwiftPM / DerivedData / ccache caches and are
+# far cheaper (roughly 10-20 minutes wall each). If the repo is flipped to
+# public, the cap disappears. See macos-demo-README.md.
+
+name: macOS live demo (CV-C58 / CV-C59 / CV-C60)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-demo
+  cancel-in-progress: false
+
+env:
+  SDK_SHA: 80e0bc6a8a788ee3644586a25aa76ad558411f0a
+  SDK_REPO: firebase/firebase-ios-sdk
+
+jobs:
+  # C58 (Database, SPM) + C60 (Functions, SPM) share one checkout, one
+  # resolve and one DerivedData so the SDK is built once, not twice.
+  demo-spm:
+    name: Demo C58 + C60 (SPM)
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - name: Check out demo files (this repo)
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check out firebase-ios-sdk at the pinned SHA
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          repository: ${{ env.SDK_REPO }}
+          ref: ${{ env.SDK_SHA }}
+          path: sdk
+          persist-credentials: false
+
+      - name: Select Xcode 26.4
+        run: |
+          ls /Applications/ | grep '^Xcode_' || true
+          if [ -d /Applications/Xcode_26.4.app ]; then
+            sudo xcode-select -s /Applications/Xcode_26.4.app/Contents/Developer
+          else
+            LATEST=$(ls -d /Applications/Xcode_26.*.app 2>/dev/null | sort | tail -1)
+            echo "Xcode 26.4 not present; using $LATEST"
+            sudo xcode-select -s "$LATEST/Contents/Developer"
+          fi
+          xcodebuild -version
+          swift --version
+
+      - name: Copy demo test files into the SDK checkout
+        run: |
+          cp demo-tests/CV58DatabaseDemoTests.m sdk/FirebaseDatabase/Tests/Unit/
+          cp demo-tests/CV60FunctionsDemoTests.swift sdk/FirebaseFunctions/Tests/Unit/
+          ls -l sdk/FirebaseDatabase/Tests/Unit/CV58DatabaseDemoTests.m \
+                sdk/FirebaseFunctions/Tests/Unit/CV60FunctionsDemoTests.swift
+
+      - name: Resolve Swift packages
+        working-directory: sdk
+        run: swift package resolve
+
+      - name: Show resolved GTMSessionFetcher version
+        working-directory: sdk
+        run: |
+          python3 -c "import json; d = json.load(open('Package.resolved')); print([p for p in d.get('pins', []) if 'gtm-session-fetcher' in p.get('identity', '') or 'gtm-session-fetcher' in p.get('location', '')])"
+
+      - name: Cache SwiftPM + DerivedData
+        uses: actions/cache@9255dc7a253b0ccc959486e2bca901246202afeb # v5.0.1
+        with:
+          path: |
+            ~/Library/Caches/org.swift.swiftpm
+            sdk/DerivedData
+          key: ${{ runner.os }}-spm-${{ hashFiles('sdk/Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-spm-
+
+      - name: Generate SPM schemes
+        working-directory: sdk
+        run: ./scripts/setup_spm_tests.sh
+
+      - name: Demo C58 (Database, websocket auth + App Check)
+        working-directory: sdk
+        run: |
+          xcodebuild test \
+            -scheme DatabaseUnit \
+            -destination 'platform=OS X,arch=x86_64' \
+            -derivedDataPath "$GITHUB_WORKSPACE/sdk/DerivedData" \
+            -only-testing:DatabaseUnit/CV58DatabaseDemoTests \
+            -collect-test-diagnostics never
+
+      - name: Demo C60 (Functions, customDomain + URL + hop legs)
+        if: always()
+        working-directory: sdk
+        run: |
+          xcodebuild test \
+            -scheme FirebaseFunctionsUnit \
+            -destination 'platform=OS X,arch=x86_64' \
+            -derivedDataPath "$GITHUB_WORKSPACE/sdk/DerivedData" \
+            -only-testing:FirebaseFunctionsUnit/CV60FunctionsDemoTests \
+            -collect-test-diagnostics never
+
+      - name: Upload test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: spm-test-logs
+          path: sdk/DerivedData/Logs/Test/*.xcresult
+          if-no-files-found: ignore
+
+  # C59 (Firestore, CMake C++ unit test). The test file is picked up
+  # automatically by the remote/ CMake glob; no CMakeLists edit is needed.
+  demo-c59:
+    name: Demo C59 (CMake)
+    runs-on: macos-26
+    timeout-minutes: 180
+    env:
+      USE_LATEST_CMAKE: "false"
+      CCACHE_DIR: ${{ runner.temp }}/ccache
+    steps:
+      - name: Check out demo files (this repo)
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check out firebase-ios-sdk at the pinned SHA
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          repository: ${{ env.SDK_REPO }}
+          ref: ${{ env.SDK_SHA }}
+          path: sdk
+          persist-credentials: false
+
+      - name: Select Xcode 26.4
+        run: |
+          ls /Applications/ | grep '^Xcode_' || true
+          if [ -d /Applications/Xcode_26.4.app ]; then
+            sudo xcode-select -s /Applications/Xcode_26.4.app/Contents/Developer
+          else
+            LATEST=$(ls -d /Applications/Xcode_26.*.app 2>/dev/null | sort | tail -1)
+            echo "Xcode 26.4 not present; using $LATEST"
+            sudo xcode-select -s "$LATEST/Contents/Developer"
+          fi
+          xcodebuild -version
+
+      - name: Copy demo test file into the SDK checkout
+        run: |
+          cp demo-tests/CV59FirestoreDemoTests.cc sdk/Firestore/core/test/unit/remote/
+          ls -l sdk/Firestore/core/test/unit/remote/CV59FirestoreDemoTests.cc
+
+      - name: Generate throwaway test CA for the TLS leg
+        run: bash scripts/make-firestore-test-ca.sh
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+        with:
+          python-version: "3.11"
+
+      - name: Set up CMake 3.31.2
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: "3.31.2"
+
+      - name: Cache ccache
+        uses: actions/cache@9255dc7a253b0ccc959486e2bca901246202afeb # v5.0.1
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: firestore-ccache-${{ runner.os }}-80e0bc6a
+          restore-keys: |
+            firestore-ccache-${{ runner.os }}-
+
+      - name: Install prerequisites (repo script)
+        working-directory: sdk
+        run: scripts/install_prereqs.sh Firestore macOS cmake
+
+      - name: Configure CMake build
+        working-directory: sdk
+        run: |
+          OPENSSL_OPTS=()
+          if OPENSSL_PREFIX="$(brew --prefix openssl@3 2>/dev/null)" && [ -d "$OPENSSL_PREFIX" ]; then
+            echo "Using OpenSSL from $OPENSSL_PREFIX"
+            OPENSSL_OPTS=("-DOPENSSL_ROOT_DIR=$OPENSSL_PREFIX")
+          fi
+          cmake -G Ninja -Wdeprecated -DCMAKE_BUILD_TYPE=Debug "${OPENSSL_OPTS[@]}" -S . -B build
+
+      - name: Build the Firestore remote test target
+        working-directory: sdk
+        run: cmake --build build --target firestore_remote_test --parallel 8
+
+      - name: Run the demo tests
+        working-directory: sdk
+        run: |
+          TEST_BIN=$(find build -name firestore_remote_test -type f | head -1)
+          echo "Test binary: $TEST_BIN"
+          "$TEST_BIN" --gtest_filter='DemoTokenTest.*' 2>&1 | tee "$GITHUB_WORKSPACE/c59-test.log"
+
+      - name: Upload test log on failure
+        if: failure()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: c59-test-log
+          path: c59-test.log
+          if-no-files-found: ignore
