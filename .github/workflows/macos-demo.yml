@@ -143,7 +143,6 @@ jobs:
     timeout-minutes: 180
     env:
       USE_LATEST_CMAKE: "false"
-      CCACHE_DIR: ${{ runner.temp }}/ccache
     steps:
       - name: Check out demo files (this repo)
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
@@ -157,6 +156,9 @@ jobs:
           ref: ${{ env.SDK_SHA }}
           path: sdk
           persist-credentials: false
+
+      - name: Set CCACHE_DIR
+        run: echo "CCACHE_DIR=$RUNNER_TEMP/ccache" >> "$GITHUB_ENV"
 
       - name: Select Xcode 26.4
         run: |
