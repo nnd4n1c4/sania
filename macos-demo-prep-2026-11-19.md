@@ -1,6 +1,7 @@
 # macOS live-demo prep report (CV-C58 / CV-C59 / CV-C60)
-Date: 2026-11-19. Repo: nnd4n1c4/sania (private, Mart's decision). No repo
-created yet at report time; files staged under ~/workspace/google-vrp/macos-demo/.
+Date: 2026-11-19. Repo: nnd4n1c4/sania (private, Mart's decision).
+Repo created 2026-11-19 ~14:58 WIB; all 7 staged files pushed and verified
+via the repo tree. First run NOT triggered yet (see cost note below).
 
 ## Design (10 lines)
 1. macos-26 runner, Xcode 26.4 selected explicitly (SDK needs 26.2+).
